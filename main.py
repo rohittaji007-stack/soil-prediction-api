@@ -1,85 +1,71 @@
-import pandas as pd
+from fastapi import FastAPI, HTTPException, Query
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor 
-from sklearn.preprocessing import StandardScaler
+import pandas as pd
 import pickle
 import os
 import asyncio
 import websockets
 import json
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+from typing import Dict, List
 
-# --- CONFIGURATION ---
-WS_URL = "wss://nikolaindustry-realtime.onrender.com/?id=905cd742-d1c3-4fdb-b940-6cac16faa792"
-CSV_FILE = 'final_training_base.csv' 
+app = FastAPI(title="Soil Intelligence Pro API")
+
+# --- 4. STRONG ENVIRONMENT: Isolated Storage ---
+# Stores raw scans for each device: { "device_id": [[18_vals], [18_vals], ...] }
+device_data: Dict[str, List[List[float]]] = {}
+# Stores final results for each device: { "device_id": { "pH": 7.0, ... } }
+device_results: Dict[str, Dict[str, float]] = {}
+
 MODEL_PACK = 'soil_model_pack_rf.pkl'
-SCAN_COUNT = 10 
-
-app = FastAPI()
-
-# Enable CORS so any website can enquire your data
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-latest_predictions = {}
-
-def build_model():
-    if not os.path.exists(MODEL_PACK):
-        df = pd.read_csv(CSV_FILE, encoding='latin1')
-        df.columns = df.columns.str.strip()
-        x_features = [f'X_{i}' for i in range(1, 19)]
-        targets = ['N(ppm)', 'P(ppm)', 'K(ppm)', 'OC_percent', 'pH', 'EC', 'Fe', 'Mn', 'Cu', 'Zn', 'B', 'S']
-        scaler = StandardScaler().fit(df[x_features].values)
-        X_train_scaled = scaler.transform(df[x_features].values)
-        trained_models = {t: RandomForestRegressor(n_estimators=100).fit(X_train_scaled, df[t].values) for t in targets}
-        with open(MODEL_PACK, 'wb') as f:
-            pickle.dump({'scaler': scaler, 'models': trained_models, 'targets': targets}, f)
-
-# Initial Load
-build_model()
 with open(MODEL_PACK, 'rb') as f:
     pkg = pickle.load(f)
 
-async def websocket_worker():
-    global latest_predictions
-    buffer = []
-    while True:
+# --- 1 & 7. DELETE LOGIC (For Hypervisor) ---
+@app.delete("/scans/{device_id}")
+async def delete_scan(device_id: str, index: int = None, clear_all: bool = False):
+    """Allows deleting a specific scan index (e.g., #5) or clearing all data."""
+    if device_id not in device_data:
+        raise HTTPException(status_code=404, detail="Device not found")
+    
+    if clear_all:
+        device_data[device_id] = []
+        return {"status": "success", "message": f"Cleared all scans for {device_id}"}
+    
+    if index is not None:
         try:
-            async with websockets.connect(WS_URL) as ws:
-                while True:
-                    msg = await ws.recv()
-                    data = json.loads(msg)
-                    current_scan = [data.get(f'X_{i}', 0) for i in range(1, 19)]
-                    buffer.append(current_scan)
-                    
-                    if len(buffer) >= SCAN_COUNT:
-                        avg_raw = np.mean(buffer, axis=0).reshape(1, -1)
-                        scaled = pkg['scaler'].transform(avg_raw)
-                        latest_predictions = {
-                            t: round(max(0.0, float(pkg['models'][t].predict(scaled)[0])), 3) 
-                            for t in pkg['targets']
-                        }
-                        buffer = []
-        except Exception as e:
-            print(f"WS Error: {e}. Reconnecting in 5s...")
-            await asyncio.sleep(5)
+            # index-1 handles the 'Scan 5' logic (0-based indexing)
+            device_data[device_id].pop(index - 1)
+            return {"status": "success", "message": f"Deleted scan {index}"}
+        except IndexError:
+            raise HTTPException(status_code=400, detail="Invalid scan index")
 
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(websocket_worker())
+# --- 3 & 5. NEW REQUEST PATTERN (Server Host) ---
+@app.post("/push/{device_id}")
+async def push_data(device_id: str, sensor_values: List[float]):
+    """Receives data directly from a device or Hypervisor."""
+    if device_id not in device_data:
+        device_data[device_id] = []
+    
+    device_data[device_id].append(sensor_values)
+    
+    # Process when 10 scans are reached for THIS specific device
+    if len(device_data[device_id]) >= 10:
+        avg_vals = np.mean(device_data[device_id], axis=0).reshape(1, -1)
+        scaled = pkg['scaler'].transform(avg_vals)
+        
+        # Calculate Random Forest predictions
+        preds = {t: round(max(0.0, float(pkg['models'][t].predict(scaled)[0])), 3) 
+                 for t in pkg['targets']}
+        
+        device_results[device_id] = preds # Store result in device's private slot
+        device_data[device_id] = [] # Reset buffer for this device only
+        return {"status": "calculated", "data": preds}
+    
+    return {"status": "stored", "count": len(device_data[device_id])}
 
-@app.get("/predict")
-async def get_prediction():
-    """Endpoint for external enquiries to get JSON data"""
-    if not latest_predictions:
-        return {"status": "processing", "message": "Collecting 10 scans..."}
-    return {"status": "success", "data": latest_predictions}
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/predict/{device_id}")
+async def get_prediction(device_id: str):
+    """Endpoint for Hypervisor to call results."""
+    if device_id not in device_results:
+        return {"status": "pending", "message": "Need more scans for this device"}
+    return {"status": "success", "device": device_id, "data": device_results[device_id]}
