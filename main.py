@@ -1,92 +1,124 @@
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
 import pickle
 import os
 from typing import Dict, List
 
 app = FastAPI(title="Soil Intelligence Pro API")
 
-# --- CONFIGURATION ---
+# --- 1. CONFIGURATION & MAPPING ---
 CSV_FILE = 'final_training_base.csv'
 MODEL_PACK = 'soil_model_pack_rf.pkl'
 
-# Memory Storage: { "device_id": [[scans]] }
-device_data: Dict[str, List[List[float]]] = {}
-
-# --- 4. CLEAN PARAMETERS (Standard Format) ---
+# Clean keys for output as requested
 TARGET_MAP = {
     'N(ppm)': 'N', 'P(ppm)': 'P', 'K(ppm)': 'K', 
     'OC_percent': 'OC', 'pH': 'PH', 'EC': 'EC', 
     'Fe': 'FE', 'Mn': 'MN', 'Cu': 'CU', 'Zn': 'ZN', 'B': 'B', 'S': 'S'
 }
 
-# Load/Build Brain
-if not os.path.exists(MODEL_PACK):
-    df = pd.read_csv(CSV_FILE, encoding='latin1')
-    df.columns = df.columns.str.strip()
-    x_features = [f'X_{i}' for i in range(1, 19)]
-    targets = list(TARGET_MAP.keys())
-    from sklearn.ensemble import RandomForestRegressor
-    from sklearn.preprocessing import StandardScaler
-    scaler = StandardScaler().fit(df[x_features].values)
-    models = {t: RandomForestRegressor(n_estimators=100).fit(scaler.transform(df[x_features].values), df[t].values) for t in targets}
-    with open(MODEL_PACK, 'wb') as f:
-        pickle.dump({'scaler': scaler, 'models': models, 'targets': targets}, f)
+# --- 2. MULTI-TENANT STORAGE ---
+# Isolated memory for 10+ devices
+device_data: Dict[str, List[List[float]]] = {}
 
-with open(MODEL_PACK, 'rb') as f:
-    pkg = pickle.load(f)
+# --- 3. AUTO-TRAIN BRAIN (Self-Healing) ---
+# This fixes the FileNotFoundError seen in your logs
+def build_model_if_missing():
+    if not os.path.exists(MODEL_PACK):
+        print(f"🧠 Training brain from {CSV_FILE}...")
+        if not os.path.exists(CSV_FILE):
+            return # Wait for user to upload CSV
+        
+        df = pd.read_csv(CSV_FILE, encoding='latin1')
+        df.columns = df.columns.str.strip()
+        x_features = [f'X_{i}' for i in range(1, 19)]
+        targets = list(TARGET_MAP.keys())
+        
+        scaler = StandardScaler().fit(df[x_features].values)
+        X_scaled = scaler.transform(df[x_features].values)
+        
+        models = {}
+        for t in targets:
+            m = RandomForestRegressor(n_estimators=100, random_state=42)
+            m.fit(X_scaled, df[t].values)
+            models[t] = m
+            
+        with open(MODEL_PACK, 'wb') as f:
+            pickle.dump({'scaler': scaler, 'models': models, 'targets': targets}, f)
 
-# --- 3. JSON ERROR HANDLING (No more HTML 404s) ---
+build_model_if_missing()
+
+# Helper to load the model safely
+def get_brain():
+    if os.path.exists(MODEL_PACK):
+        with open(MODEL_PACK, 'rb') as f:
+            return pickle.load(f)
+    return None
+
+# --- 4. JSON ERROR HANDLER ---
+# Returns JSON instead of HTML for 404 errors
 @app.exception_handler(404)
 async def custom_404_handler(request: Request, __):
     return JSONResponse(
         status_code=404,
-        content={"status": "error", "message": "Endpoint not found. Use /predict/{id}/{data}"}
+        content={"status": "error", "message": "Invalid URL. Use /predict/Device_ID?data=values"}
     )
 
-# --- 1, 2 & 5. THE CONSOLIDATED GET PREDICT ---
-@app.get("/predict/{device_id}/{data_string}")
-async def predict(device_id: str, data_string: str):
+# --- 5. HOME PAGE ---
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return """
+    <body style='font-family: Arial; text-align: center; margin-top: 100px;'>
+        <h1 style='color: #2E7D32;'>🌱 Soil API is Live</h1>
+        <p>Device Status: Operational</p>
+        <p>Docs: <a href='/docs'>/docs</a></p>
+    </body>
     """
-    Example: /predict/DEV01/1.2,3.4,5.6... (18 values)
-    This single call Pushes, Manages, and Returns predictions.
-    """
-    try:
-        # 1. Parse Input
-        vals = [float(x) for x in data_string.split(',')]
-        if len(vals) != 18:
-            return {"status": "error", "message": "Provide exactly 18 comma-separated values"}
 
-        # 2. Add to Device Memory (Isolated by ID)
+# --- 6. UNIFIED PREDICT (Stable Query Pattern) ---
+# This single endpoint handles Push, Store, and Predict
+@app.get("/predict/{device_id}")
+async def predict(device_id: str, data: str = None):
+    pkg = get_brain()
+    if not pkg:
+        return {"status": "error", "message": "Model brain not built. Check CSV file."}
+
+    # If no data, just show count (Garbage collection check)
+    if not data:
+        count = len(device_data.get(device_id, []))
+        return {"status": "pending", "device": device_id, "scans_collected": f"{count}/10"}
+
+    try:
+        # Convert data string to list
+        vals = [float(x) for x in data.split(',')]
+        if len(vals) != 18:
+            return {"status": "error", "message": "Need exactly 18 values"}
+
         if device_id not in device_data:
             device_data[device_id] = []
+        
         device_data[device_id].append(vals)
 
-        # 3. Process Logic
+        # Process at 10 scans
         if len(device_data[device_id]) >= 10:
             avg = np.mean(device_data[device_id], axis=0).reshape(1, -1)
             scaled = pkg['scaler'].transform(avg)
             
-            # Create Clean Key-Value Output (N: 10, P: 5, etc.)
-            output = {}
+            # Clean Key-Value Output
+            prediction = {}
             for raw_key, clean_key in TARGET_MAP.items():
                 val = float(pkg['models'][raw_key].predict(scaled)[0])
-                output[clean_key] = round(max(0.0, val), 3)
+                prediction[clean_key] = round(max(0.0, val), 3)
             
-            # Garbage Collection: Clear memory for this device after prediction
+            # Garbage Collection: Reset memory for this ID
             device_data[device_id] = []
-            
-            return {"status": "success", "device": device_id, "prediction": output}
+            return {"status": "success", "device": device_id, "prediction": prediction}
 
-        # Return status if 10 scans not reached
-        return {
-            "status": "stored", 
-            "device": device_id, 
-            "current_count": len(device_data[device_id]),
-            "needed": 10
-        }
+        return {"status": "stored", "device": device_id, "current_count": len(device_data[device_id])}
 
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": "Data must be 18 numbers separated by commas"}
