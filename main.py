@@ -6,7 +6,6 @@ import os
 
 app = FastAPI()
 
-# --- CONFIGURATION ---
 MODEL_PACK = 'soil_model_pack_rf.pkl'
 TARGET_MAP = {
     'N(ppm)': 'N', 'P(ppm)': 'P', 'K(ppm)': 'K', 
@@ -17,33 +16,37 @@ TARGET_MAP = {
 @app.post("/predict_batch/{device_id}")
 async def predict_batch(device_id: str, all_scans: list = Body(...)):
     try:
-        # 1. Check if the uploaded brain exists
         if not os.path.exists(MODEL_PACK):
-            return {"status": "error", "message": "Model file (.pkl) not found. Please upload it to GitHub."}
+            return {"status": "error", "message": "Model file (.pkl) not found."}
 
-        # 2. Load the pre-trained brain
         with open(MODEL_PACK, 'rb') as f:
             pkg = pickle.load(f)
 
-        # 3. Run predictions on the 10-scan 'Single Throw'
-        batch_results = []
+        # 1. Run all 10 predictions
+        all_predictions = []
         for scan in all_scans:
-            # Prepare data
             input_data = np.array(scan).reshape(1, -1)
             scaled_data = pkg['scaler'].transform(input_data)
             
-            # Predict all 12 parameters
             single_pred = {}
             for raw, clean in TARGET_MAP.items():
                 val = float(pkg['models'][raw].predict(scaled_data)[0])
-                single_pred[clean] = round(max(0.0, val), 3)
-            
-            batch_results.append(single_pred)
+                single_pred[clean] = val
+            all_predictions.append(single_pred)
 
+        # 2. Calculate the AVERAGE for each of the 12 parameters
+        final_averaged_report = {}
+        for clean_key in TARGET_MAP.values():
+            # Sum up the value from all 10 predictions and divide by 10
+            avg_val = sum(p[clean_key] for p in all_predictions) / len(all_predictions)
+            final_averaged_report[clean_key] = round(max(0.0, avg_val), 3)
+
+        # 3. Return only the SINGLE averaged result
         return {
             "status": "success",
             "device": device_id,
-            "results": batch_results
+            "samples_processed": len(all_scans),
+            "final_report": final_averaged_report
         }
 
     except Exception as e:
