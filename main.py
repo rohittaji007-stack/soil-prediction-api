@@ -1,10 +1,22 @@
 from fastapi import FastAPI, Body, Request
+from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import pandas as pd
 import pickle
 import os
 
 app = FastAPI()
+
+# ==========================================
+# ADD CORS MIDDLEWARE - This fixes the 405 error!
+# ==========================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins (you can restrict this later)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods including OPTIONS
+    allow_headers=["*"],  # Allows all headers including Content-Type
+)
 
 MODEL_PACK = 'soil_model_pack_rf.pkl'
 TARGET_MAP = {
