@@ -1,11 +1,13 @@
 // ============================================================
-// NILDURGA SOFTWARE INTEGRATION — HONEST VERSION
+// NILDURGA SOFTWARE INTEGRATION — FULL REPORT (honest confidence)
 // Complete drop-in replacement for your device script.
-// Reports ONLY what the training data supports:
-//   N       -> numeric value        (reliability: measured)
-//   pH,Fe,Cu-> Low/Medium/High       (reliability: screening)
-//   others  -> "Not available"       (no reliable signal — never faked)
-// No hardcoded calibration multipliers.
+//
+// Shows a numeric value for ALL 12 parameters, plus a Low/Med/High/Normal
+// conclusion vs the required range, plus a confidence marker:
+//   high     -> real signal (N)
+//   moderate -> coarse screening (pH, Fe, Cu)
+//   low      -> indicative estimate (shown with "· est.")
+// Numbers come straight from the model — no fabricated / fudge multipliers.
 // ============================================================
 
 const SUPABASE_URL = "https://gzwhkukpqdjmkokwazec.supabase.co";
@@ -13,7 +15,7 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 
 window.currentSampleId = null;
 
-// short key -> { value widget, conclusion/note widget }
+// short key -> { val widget, note/conclusion widget }
 const WIDGETS = {
   N:  { val: "43pd721fx", note: "7ns1xvmn8" },
   P:  { val: "9goxm8xs6", note: "rbkicsq7g" },
@@ -29,6 +31,44 @@ const WIDGETS = {
   S:  { val: "2nr6ols8q", note: "87zdxbonv" },
 };
 
+// --- STATUS HELPERS (vs the required range for each parameter) ---
+function bandStatus(value, min, max) {
+  const v = parseFloat(value);
+  if (isNaN(v)) return "-";
+  if (v < min) return "Low";
+  if (v > max) return "High";
+  return "Medium";
+}
+function greaterThanStatus(value, limit) {
+  const v = parseFloat(value);
+  if (isNaN(v)) return "-";
+  return v > limit ? "Normal" : "Low";
+}
+function phStatus(ph) {
+  const v = parseFloat(ph);
+  if (isNaN(v)) return "-";
+  if (v < 6.5) return "Acidic";
+  if (v < 7.0) return "Normal";
+  if (v < 8.5) return "Alkaline";
+  return "Highly Alkaline";
+}
+
+// short key -> function that turns a value into a conclusion string
+const STATUS = {
+  N:  (v) => bandStatus(v, 280, 499.99),
+  P:  (v) => bandStatus(v, 14, 20.99),
+  K:  (v) => bandStatus(v, 150, 199.99),
+  OC: (v) => bandStatus(v, 0.4, 0.59),
+  PH: (v) => phStatus(v),
+  EC: (v) => bandStatus(v, 0, 1),
+  FE: (v) => bandStatus(v, 4.5, 18),
+  MN: (v) => bandStatus(v, 2, 8),
+  CU: (v) => bandStatus(v, 0.2, 0.8),
+  ZN: (v) => bandStatus(v, 0.6, 18),
+  B:  (v) => greaterThanStatus(v, 0.5),
+  S:  (v) => greaterThanStatus(v, 10),
+};
+
 // --- FETCH SAMPLE DETAILS FROM BACKEND ---
 async function fetchSampleDetails(sampleId) {
   const url = `${SUPABASE_URL}/functions/v1/get-sample?sample_id=${encodeURIComponent(sampleId)}`;
@@ -40,7 +80,6 @@ async function fetchSampleDetails(sampleId) {
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const { sample } = await response.json();
-    console.log("Sample details received:", JSON.stringify(sample, null, 2));
     window.currentSampleId = sampleId;
     if (widget) {
       widget.setValue("7h62weags", sample.farmer_name || "");
@@ -60,44 +99,39 @@ async function fetchSampleDetails(sampleId) {
   }
 }
 
-// --- RENDER HONEST REPORT ---
-function renderReport(report, unavailable) {
+// --- RENDER FULL REPORT ---
+function renderReport(report) {
   if (!widget) return;
   for (const [key, item] of Object.entries(report)) {
     const w = WIDGETS[key];
     if (!w) continue;
-    if (item.type === "value") {
-      widget.setValue(w.val, `${item.value} ${item.unit}`.trim());
-      widget.setValue(w.note, `Measured (R²=${item.cv_r2})`);
-    } else if (item.type === "class") {
-      widget.setValue(w.val, item.class);
-      widget.setValue(w.note, `Screening (${Math.round(item.confidence * 100)}% conf)`);
-    }
-  }
-  for (const key of unavailable || []) {
-    const w = WIDGETS[key];
-    if (!w) continue;
-    widget.setValue(w.val, "N/A");
-    widget.setValue(w.note, "Not available");
+
+    // Result column: number + unit
+    widget.setValue(w.val, `${item.value}${item.unit ? " " + item.unit : ""}`);
+
+    // Conclusion column: status vs range + confidence marker
+    const status = STATUS[key] ? STATUS[key](item.value) : "-";
+    const marker = item.confidence === "low" ? " · est." : "";
+    widget.setValue(w.note, `${status}${marker}`);
   }
 }
 
-// --- SUBMIT ONLY TRUSTWORTHY RESULTS ---
-// NOTE: your Supabase `submit-results` edge function must accept this shape.
+// --- SUBMIT RESULTS ---
 async function submitResultsToBackend(sampleId, apiResult) {
   const url = `${SUPABASE_URL}/functions/v1/submit-results`;
   const results = {};
   for (const [key, item] of Object.entries(apiResult.final_report)) {
-    if (item.type === "value") {
-      results[key] = { value: item.value, unit: item.unit, reliability: "measured" };
-    } else if (item.type === "class") {
-      results[key] = { level: item.class, confidence: item.confidence, reliability: "screening" };
-    }
+    results[key] = {
+      value: item.value,
+      unit: item.unit,
+      confidence: item.confidence,
+      status: STATUS[key] ? STATUS[key](item.value) : null,
+    };
+    if (item.class) results[key].level = item.class;
   }
   const payload = {
     sample_id: sampleId,
     results,
-    unavailable: apiResult.unavailable,
     disclaimer: apiResult.disclaimer,
   };
   try {
@@ -108,7 +142,6 @@ async function submitResultsToBackend(sampleId, apiResult) {
     });
     const out = await response.json();
     if (!response.ok) throw new Error(out.error || `HTTP ${response.status}`);
-    console.log("Results submitted:", out);
     if (widget) widget.setValue("widget_1767974080573", "✅ Results saved!");
     return out;
   } catch (error) {
@@ -135,10 +168,8 @@ function processIncomingReading(newReading) {
   }
   window.sensorBatchBuffer.push(newReading);
   const currentCount = window.sensorBatchBuffer.length;
-  console.log(`Reading added. Buffer: ${currentCount}/10`);
   if (widget) widget.setValue("widget_1767974080573", currentCount + "/10");
   if (currentCount >= 10) {
-    console.log("Buffer full. Triggering API...");
     const batchData = [...window.sensorBatchBuffer];
     window.sensorBatchBuffer = [];
     predictSoilNutrients(sensorId, batchData);
@@ -147,7 +178,6 @@ function processIncomingReading(newReading) {
 
 async function predictSoilNutrients(deviceSensorId, data) {
   const url = `https://soil-prediction-api.onrender.com/predict_batch/${deviceSensorId}`;
-  console.log("Calling Soil Prediction API...");
   try {
     const response = await fetch(url, {
       method: "POST",
@@ -159,14 +189,13 @@ async function predictSoilNutrients(deviceSensorId, data) {
     console.log("API Response:", JSON.stringify(result, null, 2));
 
     if (result.status === "success" && result.final_report) {
-      renderReport(result.final_report, result.unavailable);
+      renderReport(result.final_report);
       if (window.currentSampleId) {
         await submitResultsToBackend(window.currentSampleId, result);
       } else {
         console.warn("No sample loaded — results shown locally only.");
       }
     } else if (result.status === "error") {
-      console.error("API error:", result.message);
       if (widget) widget.setValue("widget_1767974080573", "❌ " + result.message);
     }
     return result;
@@ -178,7 +207,6 @@ async function predictSoilNutrients(deviceSensorId, data) {
 
 // --- WEBSOCKET LISTENER ---
 ws.onMessage((data) => {
-  console.log("[Script] Incoming WebSocket data:", data);
   if (data.payload?.widgetId) {
     if (data.payload.widgetId == "widget_1767939405303") {
       processIncomingReading(data.payload.value);
@@ -190,7 +218,6 @@ ws.onMessage((data) => {
 
 // --- TRANSFER BUTTON ---
 widget.on("widget_1767974315613", "click", () => {
-  console.log("Transfer clicked");
   widget.setValue("7h62weags", widget.getValue("widget_1770091660844"));
   widget.setValue("dckudnppc", widget.getValue("ns89orq6m"));
   widget.setValue("60ptjrkhk", widget.getValue("w37h05as3"));

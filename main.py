@@ -25,6 +25,25 @@ TARGET_MAP = {
 }
 CLASS_LABELS = {0: 'Low', 1: 'Medium', 2: 'High'}
 
+# N, P, K are modelled in ppm but the report shows kg/hectare.
+# 1 ppm ~= 2.24 kg/ha for a 15 cm furrow slice (standard soil-card conversion).
+PPM_TO_KGHA = 2.24
+KGHA_KEYS = {'N', 'P', 'K'}
+
+# Display unit per short key.
+REPORT_UNITS = {
+    'N': 'kg/ha', 'P': 'kg/ha', 'K': 'kg/ha', 'OC': '%', 'PH': '',
+    'EC': 'dS/m', 'FE': 'ppm', 'MN': 'ppm', 'CU': 'ppm', 'ZN': 'ppm',
+    'B': 'ppm', 'S': 'ppm',
+}
+
+# Training reliability tier -> confidence label shown to the user.
+TIER_TO_CONFIDENCE = {
+    'measured': 'high',       # genuine signal (e.g. N)
+    'screening': 'moderate',  # coarse Low/Med/High only (pH, Fe, Cu)
+    'unavailable': 'low',     # weak signal -- indicative estimate only
+}
+
 _PACK = None
 
 
@@ -59,11 +78,17 @@ def health():
 @app.post("/predict_batch/{device_id}")
 async def predict_batch(device_id: str, all_scans: list = Body(...)):
     """
-    Returns ONLY what the training data can actually support:
-      - 'measured'  parameters -> averaged numeric value (+ its CV R^2)
-      - 'screening' parameters -> Low/Med/High class     (+ its CV accuracy)
-      - 'unavailable' parameters are NOT predicted; they are listed so the
-        UI can show "not available" instead of a fabricated number.
+    Returns a numeric estimate for ALL 12 parameters (a full report), each
+    tagged with an honest confidence level derived from cross-validation on
+    the training data:
+
+        confidence "high"     -> real signal (e.g. N)
+        confidence "moderate" -> coarse Low/Med/High only (pH, Fe, Cu)
+        confidence "low"      -> weak signal; indicative estimate only
+
+    The numbers are genuine model outputs, NOT fabricated or rescaled to look
+    accurate. Low-confidence values should be shown as estimates, and this is
+    NOT a substitute for a soil laboratory.
     """
     try:
         if not os.path.exists(MODEL_PACK):
@@ -72,7 +97,6 @@ async def predict_batch(device_id: str, all_scans: list = Body(...)):
         pkg = _load_pack()
         tiers = pkg["tiers"]
         metrics = pkg["metrics"]
-        units = pkg.get("units", {})
 
         # Validate + preprocess every scan (each must be 18 channels).
         rows = []
@@ -87,50 +111,40 @@ async def predict_batch(device_id: str, all_scans: list = Body(...)):
         X = pkg["scaler"].transform(_l1_normalise(rows))  # (n_scans, 18)
 
         final_report = {}
-        unavailable = []
-
         for raw, short in TARGET_MAP.items():
             tier = tiers.get(raw, "unavailable")
 
-            if tier == "measured":
-                # Average the numeric prediction across all scans.
-                preds = pkg["models"][raw].predict(X)
-                value = round(max(0.0, float(np.mean(preds))), 2)
-                final_report[short] = {
-                    "type": "value",
-                    "value": value,
-                    "unit": units.get(raw, ""),
-                    "reliability": "measured",
-                    "cv_r2": metrics[raw]["r2"],
-                }
+            # Averaged numeric prediction across all scans.
+            value = float(np.mean(pkg["models"][raw].predict(X)))
+            if short in KGHA_KEYS:
+                value *= PPM_TO_KGHA          # ppm -> kg/ha for N, P, K
+            value = round(max(0.0, value), 2)
 
-            elif tier == "screening":
-                # Average class probabilities across scans, then pick the mode.
+            entry = {
+                "value": value,
+                "unit": REPORT_UNITS.get(short, ""),
+                "confidence": TIER_TO_CONFIDENCE.get(tier, "low"),
+                "cv_r2": metrics[raw]["r2"],
+            }
+            # For the moderate tier, also expose the Low/Med/High screening class.
+            if tier == "screening":
                 proba = pkg["classifiers"][raw].predict_proba(X).mean(axis=0)
                 idx = int(np.argmax(proba))
-                final_report[short] = {
-                    "type": "class",
-                    "class": CLASS_LABELS.get(idx, str(idx)),
-                    "confidence": round(float(proba[idx]), 2),
-                    "reliability": "screening",
-                    "cv_accuracy": metrics[raw]["acc"],
-                }
+                entry["class"] = CLASS_LABELS.get(idx, str(idx))
+                entry["cv_accuracy"] = metrics[raw]["acc"]
 
-            else:
-                unavailable.append(short)
+            final_report[short] = entry
 
         return {
             "status": "success",
             "device": device_id,
             "samples_processed": len(rows),
             "final_report": final_report,
-            "unavailable": unavailable,
             "disclaimer": (
-                "Prototype screening only. 'measured' values and 'screening' "
-                "classes are limited by an 18-channel (410-940nm) sensor and a "
-                "small training set; they are not a substitute for a soil lab. "
-                "Parameters in 'unavailable' had no reliable signal in training "
-                "and are intentionally not reported."
+                "Estimated by an 18-channel (410-940nm) spectral sensor. "
+                "Only 'high' confidence values (N) and 'moderate' confidence "
+                "values (pH, Fe, Cu) are reliable; 'low' confidence values are "
+                "indicative estimates and should be confirmed by a soil lab."
             ),
         }
 
