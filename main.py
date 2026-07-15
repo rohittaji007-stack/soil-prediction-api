@@ -1,9 +1,19 @@
 from fastapi import FastAPI, Body
+from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import pickle
 import os
 
 app = FastAPI()
+
+# CORS: allow the browser-based device dashboard to call this API.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 MODEL_PACK = 'soil_model_pack_rf.pkl'
 
